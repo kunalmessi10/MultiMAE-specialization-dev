@@ -20,6 +20,9 @@ from .native_scaler import *
 from .optim_factory import create_optimizer
 from .registry import model_entrypoint, register_model
 from .task_balancing import *
-from .taskonomy import *
+try:
+    from .taskonomy import *
+except (ImportError, ValueError) as exc:
+    TASKONOMY_IMPORT_ERROR = exc
 from .transforms import *
 from .transforms_factory import create_transform

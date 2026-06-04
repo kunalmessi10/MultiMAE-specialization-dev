@@ -13,3 +13,6 @@ runs/
 *.DS_Store
 notebooks/
 pretrained/
+AGENTS.MD
+TASKS.MD
+progress_reports/
