@@ -16,3 +16,4 @@ pretrained/
 AGENTS.MD
 TASKS.MD
 progress_reports/
+run_pretrain.sh
