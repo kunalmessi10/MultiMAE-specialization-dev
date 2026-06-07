@@ -181,6 +181,16 @@ def get_args():
 
     # Dataset parameters
     parser.add_argument('--data_path', default=data_constants.IMAGENET_TRAIN_PATH, type=str, help='dataset path')
+    parser.add_argument('--mixture_data_paths', default=None, nargs='+', type=str,
+                        help='Optional list of dataset roots for weighted pretraining sampling.')
+    parser.add_argument('--mixture_weights', default=None, nargs='+', type=float,
+                        help='Relative sampling weights for mixture_data_paths.')
+    parser.add_argument('--mixture_replacement', default=None, nargs='+', type=str,
+                        help='Per-source replacement flags for mixture sampling, e.g. false true.')
+    parser.add_argument('--mixture_samples_per_epoch', default=None, type=int,
+                        help='Number of artificial samples per epoch for mixture sampling.')
+    parser.add_argument('--mixture_debug_batches', default=0, type=int,
+                        help='If > 0, print mixture source counts for this many batches and exit.')
     parser.add_argument('--imagenet_default_mean_and_std', default=True, action='store_true')
 
     # Misc.
@@ -345,7 +355,7 @@ def main(args):
     else:
         sampler_train = torch.utils.data.RandomSampler(dataset_train)
 
-    if global_rank == 0 and args.log_wandb:
+    if global_rank == 0 and args.log_wandb and args.mixture_debug_batches <= 0:
         log_writer = utils.WandbLogger(args)
     else:
         log_writer = None
@@ -359,6 +369,23 @@ def main(args):
         pin_memory=args.pin_mem,
         drop_last=True,
     )
+
+    if args.mixture_debug_batches > 0:
+        if not hasattr(dataset_train, 'resolve_source_index'):
+            raise ValueError("mixture_debug_batches requires mixture_data_paths")
+        max_samples = args.mixture_debug_batches * args.batch_size
+        source_counts = np.zeros(len(dataset_train.datasets), dtype=np.int64)
+        for sample_number, dataset_index in enumerate(sampler_train):
+            if sample_number >= max_samples:
+                break
+            source_idx, _ = dataset_train.resolve_source_index(dataset_index)
+            source_counts[source_idx] += 1
+        total_count = int(source_counts.sum())
+        source_probs = source_counts / max(total_count, 1)
+        print(f"Mixture debug counted {total_count} samples from {args.mixture_debug_batches} batches")
+        for source_idx, (count, prob) in enumerate(zip(source_counts, source_probs)):
+            print(f"  source {source_idx}: count={int(count)}, fraction={prob:.4f}")
+        return
 
     model.to(device)
     loss_balancer.to(device)
@@ -409,6 +436,8 @@ def main(args):
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
+        if hasattr(dataset_train, 'set_epoch'):
+            dataset_train.set_epoch(epoch)
         if log_writer is not None:
             log_writer.set_step(epoch * num_training_steps_per_epoch)
         train_stats = train_one_epoch(
