@@ -132,6 +132,8 @@ def get_args():
                         help='Set to True/False to enable/disable computing the loss on non-masked tokens')
     parser.add_argument('--no_loss_on_unmasked', action='store_false', dest='loss_on_unmasked')
     parser.set_defaults(loss_on_unmasked=False)
+    parser.add_argument('--loss_tasks', default='', type=str,
+                        help='Diagnostic override: hyphen-separated tasks to include in optimizer loss. Empty means all predicted tasks.')
 
 
     # Optimizer parameters
@@ -181,6 +183,16 @@ def get_args():
 
     # Dataset parameters
     parser.add_argument('--data_path', default=data_constants.IMAGENET_TRAIN_PATH, type=str, help='dataset path')
+    parser.add_argument('--mixture_data_paths', default=None, nargs='+', type=str,
+                        help='Optional list of dataset roots for weighted pretraining sampling.')
+    parser.add_argument('--mixture_weights', default=None, nargs='+', type=float,
+                        help='Relative sampling weights for mixture_data_paths.')
+    parser.add_argument('--mixture_replacement', default=None, nargs='+', type=str,
+                        help='Per-source replacement flags for mixture sampling, e.g. false true.')
+    parser.add_argument('--mixture_samples_per_epoch', default=None, type=int,
+                        help='Number of artificial samples per epoch for mixture sampling.')
+    parser.add_argument('--mixture_debug_batches', default=0, type=int,
+                        help='If > 0, print mixture source counts for this many batches and exit.')
     parser.add_argument('--imagenet_default_mean_and_std', default=True, action='store_true')
 
     # Misc.
@@ -196,6 +208,8 @@ def get_args():
     parser.set_defaults(auto_resume=True)
 
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N', help='start epoch')
+    parser.add_argument('--stop_after_epoch', default=None, type=int,
+                        help='Optional diagnostic stop: exit training after saving/logging this epoch.')
     parser.add_argument('--num_workers', default=10, type=int)
     parser.add_argument('--pin_mem', action='store_true',
                         help='Pin CPU memory in DataLoader for more efficient (sometimes) transfer to GPU.')
@@ -345,7 +359,7 @@ def main(args):
     else:
         sampler_train = torch.utils.data.RandomSampler(dataset_train)
 
-    if global_rank == 0 and args.log_wandb:
+    if global_rank == 0 and args.log_wandb and args.mixture_debug_batches <= 0:
         log_writer = utils.WandbLogger(args)
     else:
         log_writer = None
@@ -359,6 +373,23 @@ def main(args):
         pin_memory=args.pin_mem,
         drop_last=True,
     )
+
+    if args.mixture_debug_batches > 0:
+        if not hasattr(dataset_train, 'resolve_source_index'):
+            raise ValueError("mixture_debug_batches requires mixture_data_paths")
+        max_samples = args.mixture_debug_batches * args.batch_size
+        source_counts = np.zeros(len(dataset_train.datasets), dtype=np.int64)
+        for sample_number, dataset_index in enumerate(sampler_train):
+            if sample_number >= max_samples:
+                break
+            source_idx, _ = dataset_train.resolve_source_index(dataset_index)
+            source_counts[source_idx] += 1
+        total_count = int(source_counts.sum())
+        source_probs = source_counts / max(total_count, 1)
+        print(f"Mixture debug counted {total_count} samples from {args.mixture_debug_batches} batches")
+        for source_idx, (count, prob) in enumerate(zip(source_counts, source_probs)):
+            print(f"  source {source_idx}: count={int(count)}, fraction={prob:.4f}")
+        return
 
     model.to(device)
     loss_balancer.to(device)
@@ -409,6 +440,8 @@ def main(args):
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
+        if hasattr(dataset_train, 'set_epoch'):
+            dataset_train.set_epoch(epoch)
         if log_writer is not None:
             log_writer.set_step(epoch * num_training_steps_per_epoch)
         train_stats = train_one_epoch(
@@ -433,7 +466,8 @@ def main(args):
             sample_tasks_uniformly=args.sample_tasks_uniformly,
             standardize_depth=args.standardize_depth,
             extra_norm_pix_loss=args.extra_norm_pix_loss,
-            fp32_output_adapters=args.fp32_output_adapters.split('-')
+            fp32_output_adapters=args.fp32_output_adapters.split('-'),
+            loss_tasks=args.loss_tasks.split('-') if args.loss_tasks else None,
         )
         if log_writer is not None:
             log_writer.update({**{k: v for k, v in train_stats.items()}, 'epoch': epoch})
@@ -450,6 +484,10 @@ def main(args):
             with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
                 f.write(json.dumps(log_stats) + "\n")
 
+        if args.stop_after_epoch is not None and epoch >= args.stop_after_epoch:
+            print(f"Stopping after epoch {epoch} due to --stop_after_epoch={args.stop_after_epoch}")
+            break
+
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
@@ -461,7 +499,8 @@ def train_one_epoch(model: torch.nn.Module, data_loader: Iterable, tasks_loss_fn
                     log_writer=None, lr_scheduler=None, start_steps=None, lr_schedule_values=None, wd_schedule_values=None,
                     num_encoded_tokens: int = 196, in_domains: List[str] = [] , loss_on_unmasked: bool = True,
                     alphas: float = 1.0, sample_tasks_uniformly: bool = False, standardize_depth: bool = True,
-                    extra_norm_pix_loss: bool = False, fp32_output_adapters: List[str] = []):
+                    extra_norm_pix_loss: bool = False, fp32_output_adapters: List[str] = [],
+                    loss_tasks: List[str] = None):
     model.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
@@ -520,11 +559,16 @@ def train_one_epoch(model: torch.nn.Module, data_loader: Iterable, tasks_loss_fn
                     task_losses[task] = tasks_loss_fn[task](preds[task].float(), target, mask=masks.get(task, None))
 
             weighted_task_losses = loss_balancer(task_losses)
-            loss = sum(weighted_task_losses.values())
+            selected_loss_tasks = loss_tasks if loss_tasks is not None else list(weighted_task_losses.keys())
+            missing_loss_tasks = [task for task in selected_loss_tasks if task not in weighted_task_losses]
+            if missing_loss_tasks:
+                raise ValueError(f"loss_tasks contains tasks with no predicted loss: {missing_loss_tasks}")
+            loss = sum(weighted_task_losses[task] for task in selected_loss_tasks)
 
-        loss_value = sum(task_losses.values()).item()
+        loss_value = loss.item()
         task_loss_values = {f'{task}_loss': l.item() for task, l in task_losses.items()}
         weighted_task_loss_values = {f'{task}_loss_weighted': l.item() for task, l in weighted_task_losses.items()}
+        selected_loss_values = {f'{task}_loss_selected': weighted_task_losses[task].item() for task in selected_loss_tasks}
 
         if not math.isfinite(loss_value):
             print("Loss is {}, stopping training".format(loss_value))
@@ -568,6 +612,7 @@ def train_one_epoch(model: torch.nn.Module, data_loader: Iterable, tasks_loss_fn
             )
             log_writer.update(task_loss_values)
             log_writer.update(weighted_task_loss_values)
+            log_writer.update(selected_loss_values)
             log_writer.set_step()
 
         if lr_scheduler is not None:

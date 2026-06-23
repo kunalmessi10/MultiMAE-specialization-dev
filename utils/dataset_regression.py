@@ -107,6 +107,8 @@ class DataAugmentationForRegression(object):
         task_dict['image'] = task_dict.pop('rgb')
         # Convert to np.array
         task_dict = {k: np.array(v) for k, v in task_dict.items()}
+        if 'depth' in task_dict:
+            task_dict['depth'] = task_dict['depth'].astype(np.float32)
 
         task_dict = self.transform(**task_dict)
 

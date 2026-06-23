@@ -14,6 +14,7 @@
 
 import os
 import random
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -116,6 +117,107 @@ class DataAugmentationForMultiMAE(object):
         repr += ")"
         return repr
 
+class MixtureMultiTaskDataset(torch.utils.data.Dataset):
+    """Map-style weighted mixture over multiple pretraining datasets."""
+
+    def __init__(
+            self,
+            datasets: Sequence[torch.utils.data.Dataset],
+            weights: Sequence[float],
+            replacement: Optional[Sequence[bool]] = None,
+            samples_per_epoch: Optional[int] = None,
+            seed: int = 0,
+    ):
+        if weights is None:
+            raise ValueError("mixture_weights must be provided when mixture_data_paths is set")
+        if len(datasets) == 0:
+            raise ValueError("mixture_data_paths must contain at least one dataset path")
+        if len(datasets) != len(weights):
+            raise ValueError("mixture_data_paths and mixture_weights must have the same length")
+        if any(weight <= 0 for weight in weights):
+            raise ValueError("mixture_weights must all be positive")
+        if replacement is None:
+            replacement = [True] * len(datasets)
+        if len(datasets) != len(replacement):
+            raise ValueError("mixture_data_paths and mixture_replacement must have the same length")
+
+        self.datasets = list(datasets)
+        self.weights = np.array(weights, dtype=np.float64)
+        self.sampling_probs = self.weights / self.weights.sum()
+        self.replacement = list(replacement)
+        self.samples_per_epoch = samples_per_epoch or sum(len(dataset) for dataset in self.datasets)
+        if self.samples_per_epoch <= 0:
+            raise ValueError("mixture_samples_per_epoch must be positive")
+        self.seed = seed
+        self.epoch = 0
+        self._plan_epoch = None
+        self._source_indices = None
+        self._sample_indices = None
+
+    def set_epoch(self, epoch: int):
+        self.epoch = epoch
+        self._plan_epoch = None
+
+    def __len__(self):
+        return self.samples_per_epoch
+
+    @staticmethod
+    def parse_replacement_flags(flags: Optional[Sequence[str]], num_datasets: int) -> Optional[List[bool]]:
+        if flags is None:
+            return None
+        if len(flags) != num_datasets:
+            raise ValueError("mixture_data_paths and mixture_replacement must have the same length")
+
+        parsed = []
+        for flag in flags:
+            if isinstance(flag, bool):
+                parsed.append(flag)
+                continue
+            normalized = flag.lower()
+            if normalized in ('true', '1', 'yes', 'y'):
+                parsed.append(True)
+            elif normalized in ('false', '0', 'no', 'n'):
+                parsed.append(False)
+            else:
+                raise ValueError("mixture_replacement values must be true/false")
+        return parsed
+
+    def _build_epoch_plan(self):
+        if self._plan_epoch == self.epoch:
+            return
+
+        rng = np.random.default_rng(self.seed + self.epoch)
+        self._source_indices = rng.choice(
+            len(self.datasets), size=self.samples_per_epoch, p=self.sampling_probs
+        ).astype(np.int64)
+        self._sample_indices = np.empty(self.samples_per_epoch, dtype=np.int64)
+
+        for dataset_idx, dataset in enumerate(self.datasets):
+            positions = np.flatnonzero(self._source_indices == dataset_idx)
+            if len(positions) == 0:
+                continue
+
+            if self.replacement[dataset_idx]:
+                self._sample_indices[positions] = rng.integers(0, len(dataset), size=len(positions))
+                continue
+
+            source_indices = []
+            while len(source_indices) < len(positions):
+                source_indices.extend(rng.permutation(len(dataset)).tolist())
+            self._sample_indices[positions] = np.array(source_indices[:len(positions)], dtype=np.int64)
+
+        self._plan_epoch = self.epoch
+
+    def resolve_source_index(self, index: int) -> Tuple[int, int]:
+        index = int(index)
+        self._build_epoch_plan()
+        return int(self._source_indices[index]), int(self._sample_indices[index])
+
+    def __getitem__(self, index: int):
+        dataset_idx, sample_idx = self.resolve_source_index(index)
+        return self.datasets[dataset_idx][sample_idx]
+
+
 def build_pretraining_dataset(args):
     transform = DataAugmentationForMAE(args)
     print("Data Aug = %s" % str(transform))
@@ -123,6 +225,26 @@ def build_pretraining_dataset(args):
 
 def build_multimae_pretraining_dataset(args):
     transform = DataAugmentationForMultiMAE(args)
+    mixture_data_paths = getattr(args, 'mixture_data_paths', None)
+    if mixture_data_paths is not None:
+        datasets = [
+            MultiTaskImageFolder(data_path, args.all_domains, transform=transform)
+            for data_path in mixture_data_paths
+        ]
+        dataset = MixtureMultiTaskDataset(
+            datasets=datasets,
+            weights=getattr(args, 'mixture_weights', None),
+            replacement=MixtureMultiTaskDataset.parse_replacement_flags(
+                getattr(args, 'mixture_replacement', None), len(datasets)
+            ),
+            samples_per_epoch=getattr(args, 'mixture_samples_per_epoch', None),
+            seed=args.seed,
+        )
+        source_lengths = ', '.join(str(len(source_dataset)) for source_dataset in datasets)
+        print(f"Using mixture dataset with source lengths [{source_lengths}], "
+              f"weights {args.mixture_weights}, replacement {dataset.replacement}, "
+              f"samples_per_epoch {len(dataset)}")
+        return dataset
     return MultiTaskImageFolder(args.data_path, args.all_domains, transform=transform)
 
 def build_dataset(is_train, args):

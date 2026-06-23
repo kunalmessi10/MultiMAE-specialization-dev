@@ -30,6 +30,7 @@ import torch.backends.cudnn as cudnn
 import torch.distributed as dist
 import torch.nn.functional as F
 import yaml
+from PIL import Image
 
 import utils
 import utils.data_constants as data_constants
@@ -40,8 +41,11 @@ from multimae.output_adapters import (ConvNeXtAdapter, DPTOutputAdapter,
 from utils import NativeScalerWithGradNormCount as NativeScaler
 from utils import create_model
 from utils.data_constants import COCO_SEMSEG_NUM_CLASSES
-from utils.datasets_semseg import build_semseg_dataset, simple_transform
+from utils.datasets_semseg import (ade_classes, build_semseg_dataset,
+                                   hypersim_classes, nyu_v2_40_classes,
+                                   simple_transform)
 from utils.dist import collect_results_cpu
+from utils.log_images import inv_norm
 from utils.log_images import log_semseg_wandb
 from utils.optim_factory import LayerDecayValueAssigner, create_optimizer
 from utils.pos_embed import interpolate_pos_embed_multimae
@@ -241,6 +245,16 @@ def get_args():
     parser.add_argument('--log_images_wandb', action='store_true')
     parser.add_argument('--log_images_freq', default=5, type=int,
                         help="Frequency of image logging (in epochs)")
+    parser.add_argument('--save_eval_metrics', action='store_true',
+                        help='Save eval metrics, including per-class scores, to metrics.json.')
+    parser.add_argument('--save_qual_outputs', action='store_true',
+                        help='Save semantic segmentation qualitative outputs during eval/test.')
+    parser.add_argument('--qual_output_dir', default='', type=str,
+                        help='Directory for qualitative outputs. Defaults to output_dir/qual_outputs/<mode>.')
+    parser.add_argument('--qual_max_images', default=None, type=int,
+                        help='Maximum number of qualitative samples to save. Defaults to all evaluated samples.')
+    parser.add_argument('--qual_seed', default=0, type=int,
+                        help='Seed recorded for reproducible downstream random collage selection.')
     parser.add_argument('--show_user_warnings', default=False, action='store_true')
 
     # Distributed training parameters
@@ -260,6 +274,7 @@ def get_args():
     # The main arg parser parses the rest of the args, the usual
     # defaults will have been overridden if config file specified.
     args = parser.parse_args(remaining)
+    args.config = args_config.config
 
     return args
 
@@ -491,23 +506,53 @@ def main(args):
         args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer, loss_scaler=loss_scaler)
 
     if args.eval:
+        qual_output_dir = args.qual_output_dir
+        if args.save_qual_outputs and not qual_output_dir:
+            qual_output_dir = os.path.join(args.output_dir, 'qual_outputs', 'val') if args.output_dir else ''
         val_stats = evaluate(model=model, criterion=criterion, data_loader=data_loader_val,
                              device=device, epoch=-1, in_domains=args.in_domains,
                              num_classes=args.num_classes, dataset_name=args.dataset_name, mode='val',
-                             fp16=args.fp16, return_all_layers=return_all_layers)
+                             fp16=args.fp16, return_all_layers=return_all_layers,
+                             qual_output_dir=qual_output_dir if args.save_qual_outputs else None,
+                             qual_max_images=args.qual_max_images)
         print(f"Performance of the network on the {len(dataset_val)} validation images")
         miou, a_acc, acc, loss = val_stats['mean_iou'], val_stats['pixel_accuracy'], val_stats['mean_accuracy'], val_stats['loss']
         print(f'* mIoU {miou:.3f} aAcc {a_acc:.3f} Acc {acc:.3f} Loss {loss:.3f}')
+        if args.save_eval_metrics:
+            metrics_dir = qual_output_dir if qual_output_dir else args.output_dir
+            save_eval_metrics_json(
+                path=os.path.join(metrics_dir, 'metrics.json'),
+                stats=val_stats,
+                per_class=val_stats.get('per_class'),
+                args=args,
+                mode='val',
+                dataset_size=len(dataset_val),
+            )
         exit(0)
 
     if args.test:
+        qual_output_dir = args.qual_output_dir
+        if args.save_qual_outputs and not qual_output_dir:
+            qual_output_dir = os.path.join(args.output_dir, 'qual_outputs', 'test') if args.output_dir else ''
         test_stats = evaluate(model=model, criterion=criterion, data_loader=data_loader_test,
                               device=device, epoch=-1, in_domains=args.in_domains,
                               num_classes=args.num_classes, dataset_name=args.dataset_name, mode='test',
-                              fp16=args.fp16, return_all_layers=return_all_layers)
+                              fp16=args.fp16, return_all_layers=return_all_layers,
+                              qual_output_dir=qual_output_dir if args.save_qual_outputs else None,
+                              qual_max_images=args.qual_max_images)
         print(f"Performance of the network on the {len(dataset_test)} test images")
         miou, a_acc, acc, loss = test_stats['mean_iou'], test_stats['pixel_accuracy'], test_stats['mean_accuracy'], test_stats['loss']
         print(f'* mIoU {miou:.3f} aAcc {a_acc:.3f} Acc {acc:.3f} Loss {loss:.3f}')
+        if args.save_eval_metrics:
+            metrics_dir = qual_output_dir if qual_output_dir else args.output_dir
+            save_eval_metrics_json(
+                path=os.path.join(metrics_dir, 'metrics.json'),
+                stats=test_stats,
+                per_class=test_stats.get('per_class'),
+                args=args,
+                mode='test',
+                dataset_size=len(dataset_test),
+            )
         exit(0)
 
     print(f"Start training for {args.epochs} epochs")
@@ -682,11 +727,174 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module, data_loa
     return {'[Epoch] ' + k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 
+def get_semseg_classes(dataset_name):
+    if dataset_name == 'ade20k':
+        return ade_classes()
+    if dataset_name == 'hypersim':
+        return hypersim_classes()
+    if dataset_name == 'nyu':
+        return nyu_v2_40_classes()
+    return [f'class_{i}' for i in range(1000)]
+
+
+def build_semseg_palette(num_classes):
+    palette = np.zeros((num_classes + 2, 3), dtype=np.uint8)
+    for label in range(num_classes):
+        lab = label
+        for bit in range(8):
+            palette[label, 0] |= (((lab >> 0) & 1) << (7 - bit))
+            palette[label, 1] |= (((lab >> 1) & 1) << (7 - bit))
+            palette[label, 2] |= (((lab >> 2) & 1) << (7 - bit))
+            lab >>= 3
+    palette[num_classes] = np.array([224, 224, 224], dtype=np.uint8)
+    palette[-1] = np.array([0, 0, 0], dtype=np.uint8)
+    return palette
+
+
+def tensor_rgb_to_uint8(image):
+    image = inv_norm(image.detach().cpu()).permute(1, 2, 0).numpy()
+    image = np.clip(image * 255.0, 0, 255).astype(np.uint8)
+    return image
+
+
+def colorize_semseg(mask, palette, ignore_index=utils.SEG_IGNORE_INDEX):
+    safe_mask = mask.copy()
+    safe_mask[safe_mask == ignore_index] = len(palette) - 1
+    safe_mask = np.clip(safe_mask, 0, len(palette) - 1)
+    return palette[safe_mask]
+
+
+def save_png(path, array):
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(array).save(path)
+
+
+def get_batch_sample_indices(data_loader, cursor, batch_size):
+    sampler = data_loader.sampler
+    dataset_size = len(data_loader.dataset)
+    if isinstance(sampler, torch.utils.data.DistributedSampler):
+        indices = list(iter(sampler))
+    elif isinstance(sampler, torch.utils.data.SequentialSampler):
+        indices = list(range(dataset_size))
+    else:
+        indices = list(iter(sampler))
+    return indices[cursor: cursor + batch_size]
+
+
+def get_sample_source(dataset, sample_index):
+    if hasattr(dataset, 'samples') and isinstance(dataset.samples, dict) and 'rgb' in dataset.samples:
+        return dataset.samples['rgb'][sample_index][0]
+    if hasattr(dataset, 'imgs') and isinstance(dataset.imgs, dict) and 'rgb' in dataset.imgs:
+        return dataset.imgs['rgb'][sample_index][0]
+    return None
+
+
+def export_semseg_qual_batch(tasks_dict, seg_pred, seg_gt, sample_indices, output_dir, dataset,
+                             num_classes, dataset_name, rank, exported_count, max_images=None):
+    output_dir = Path(output_dir)
+    palette = build_semseg_palette(num_classes)
+    manifest_path = output_dir / f'manifest_rank{rank}.jsonl'
+    rows = []
+
+    seg_pred_argmax = seg_pred[:, :num_classes].argmax(dim=1).detach().cpu().numpy()
+    seg_gt = seg_gt.detach().cpu().numpy()
+    rgb = tasks_dict['rgb'].detach().cpu()
+
+    for local_idx, sample_index in enumerate(sample_indices):
+        if max_images is not None and sample_index >= max_images:
+            continue
+
+        stem = f'sample_{sample_index:06d}'
+        pred = seg_pred_argmax[local_idx].astype(np.uint8)
+        gt = seg_gt[local_idx].copy()
+        gt[gt == num_classes] = utils.SEG_IGNORE_INDEX
+        gt_png = gt.copy()
+        gt_png[gt_png == utils.SEG_IGNORE_INDEX] = 255
+        gt_png = gt_png.astype(np.uint8)
+
+        rgb_img = tensor_rgb_to_uint8(rgb[local_idx])
+        pred_color = colorize_semseg(pred, palette)
+        gt_color = colorize_semseg(gt, palette)
+        pred_overlay = (0.55 * rgb_img + 0.45 * pred_color).astype(np.uint8)
+
+        paths = {
+            'rgb': output_dir / 'rgb' / f'{stem}.png',
+            'pred_mask': output_dir / 'pred_masks' / f'{stem}.png',
+            'gt_mask': output_dir / 'gt_masks' / f'{stem}.png',
+            'pred_color': output_dir / 'pred_color' / f'{stem}.png',
+            'gt_color': output_dir / 'gt_color' / f'{stem}.png',
+            'pred_overlay': output_dir / 'pred_overlay' / f'{stem}.png',
+        }
+        save_png(paths['rgb'], rgb_img)
+        save_png(paths['pred_mask'], pred)
+        save_png(paths['gt_mask'], gt_png)
+        save_png(paths['pred_color'], pred_color)
+        save_png(paths['gt_color'], gt_color)
+        save_png(paths['pred_overlay'], pred_overlay)
+
+        rows.append({
+            'sample_index': int(sample_index),
+            'dataset_name': dataset_name,
+            'rank': int(rank),
+            'source_rgb': get_sample_source(dataset, sample_index),
+            **{key: str(path.relative_to(output_dir)) for key, path in paths.items()},
+        })
+        exported_count += 1
+
+    if rows:
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(manifest_path, mode='a', encoding='utf-8') as f:
+            for row in rows:
+                f.write(json.dumps(row) + '\n')
+
+    return exported_count
+
+
+def merge_qual_manifests(output_dir):
+    output_dir = Path(output_dir)
+    rows_by_index = {}
+    for manifest_path in sorted(output_dir.glob('manifest_rank*.jsonl')):
+        with open(manifest_path, mode='r', encoding='utf-8') as f:
+            for line in f:
+                row = json.loads(line)
+                rows_by_index.setdefault(row['sample_index'], row)
+    manifest_path = output_dir / 'manifest.jsonl'
+    with open(manifest_path, mode='w', encoding='utf-8') as f:
+        for sample_index in sorted(rows_by_index):
+            f.write(json.dumps(rows_by_index[sample_index]) + '\n')
+    return manifest_path
+
+
+def save_eval_metrics_json(path, stats, per_class, args, mode, dataset_size):
+    if not utils.is_main_process():
+        return
+    checkpoint = args.resume if args.resume else ''
+    payload = {
+        'mode': mode,
+        'dataset_name': args.dataset_name,
+        'dataset_size': dataset_size,
+        'data_path': args.data_path,
+        'eval_data_path': args.eval_data_path,
+        'output_dir': args.output_dir,
+        'checkpoint': checkpoint,
+        'config': args.config,
+        'world_size': utils.get_world_size(),
+        'qual_seed': args.qual_seed,
+        'metrics': {k: float(v) for k, v in stats.items() if isinstance(v, (int, float, np.floating))},
+        'per_class': per_class,
+    }
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, mode='w', encoding='utf-8') as f:
+        json.dump(payload, f, indent=2)
+
+
 @torch.no_grad()
 def evaluate(model, criterion, data_loader, device, epoch, in_domains, num_classes, dataset_name,
-             log_images=False, mode='val', fp16=True, return_all_layers=False):
+             log_images=False, mode='val', fp16=True, return_all_layers=False,
+             qual_output_dir=None, qual_max_images=None):
     # Switch to evaluation mode
     model.eval()
+    num_classes = int(num_classes)
 
     metric_logger = utils.MetricLogger(delimiter="  ")
     if mode == 'val':
@@ -699,6 +907,9 @@ def evaluate(model, criterion, data_loader, device, epoch, in_domains, num_class
 
     seg_preds = []
     seg_gts = []
+    sample_indices = []
+    export_cursor = 0
+    exported_count = 0
 
     rgb_gts = None
     seg_preds_with_void = None
@@ -712,6 +923,9 @@ def evaluate(model, criterion, data_loader, device, epoch, in_domains, num_class
             task: tensor.to(device, non_blocking=True)
             for task, tensor in x.items()
         }
+        batch_size = next(iter(tasks_dict.values())).shape[0]
+        batch_sample_indices = get_batch_sample_indices(data_loader, export_cursor, batch_size)
+        export_cursor += batch_size
 
         input_dict = {
             task: tensor
@@ -735,12 +949,28 @@ def evaluate(model, criterion, data_loader, device, epoch, in_domains, num_class
         seg_pred_argmax = seg_pred[:, :num_classes].argmax(dim=1)
         seg_preds.extend(list(seg_pred_argmax.cpu().numpy()))
         seg_gts.extend(list(seg_gt.cpu().numpy()))
+        sample_indices.extend([int(idx) for idx in batch_sample_indices])
 
         if log_images:
             rgb_gts.extend(tasks_dict['rgb'].cpu().unbind(0))
             seg_preds_with_void.extend(list(seg_pred.argmax(dim=1).cpu().numpy()))
             if 'depth' in tasks_dict:
                 depth_gts.extend(tasks_dict['depth'].cpu().unbind(0))
+
+        if qual_output_dir:
+            exported_count = export_semseg_qual_batch(
+                tasks_dict=tasks_dict,
+                seg_pred=seg_pred,
+                seg_gt=seg_gt,
+                sample_indices=batch_sample_indices,
+                output_dir=qual_output_dir,
+                dataset=data_loader.dataset,
+                num_classes=num_classes,
+                dataset_name=dataset_name,
+                rank=utils.get_rank(),
+                exported_count=exported_count,
+                max_images=qual_max_images,
+            )
 
         metric_logger.update(loss=loss_value)
 
@@ -750,8 +980,10 @@ def evaluate(model, criterion, data_loader, device, epoch, in_domains, num_class
         log_semseg_wandb(rgb_gts, seg_preds_with_void, seg_gts, depth_gts=depth_gts, dataset_name=dataset_name, prefix=prefix)
 
     scores = compute_metrics_distributed(seg_preds, seg_gts, size=len(data_loader.dataset), num_classes=num_classes,
-                                         device=device, ignore_index=utils.SEG_IGNORE_INDEX)
+                                         device=device, ignore_index=utils.SEG_IGNORE_INDEX,
+                                         dataset_name=dataset_name, return_per_class=True)
 
+    per_class = scores.pop('per_class')
     for k, v in scores.items():
         metric_logger.update(**{f"{k}": v})
 
@@ -761,10 +993,18 @@ def evaluate(model, criterion, data_loader, device, epoch, in_domains, num_class
     print(f'* mIoU {metric_logger.mean_iou.global_avg:.3f} aAcc {metric_logger.pixel_accuracy.global_avg:.3f} '
           f'Acc {metric_logger.mean_accuracy.global_avg:.3f} Loss {metric_logger.loss.global_avg:.3f}')
 
-    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+    if qual_output_dir and utils.get_world_size() > 1:
+        dist.barrier()
+    if qual_output_dir and utils.is_main_process():
+        merge_qual_manifests(qual_output_dir)
+
+    stats = {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+    stats['per_class'] = per_class
+    return stats
 
 
-def compute_metrics_distributed(seg_preds, seg_gts, size, num_classes, device, ignore_index=utils.SEG_IGNORE_INDEX, dist_on='cpu'):
+def compute_metrics_distributed(seg_preds, seg_gts, size, num_classes, device, ignore_index=utils.SEG_IGNORE_INDEX,
+                                dist_on='cpu', dataset_name='ade20k', return_per_class=False):
 
     # Replace void by ignore in gt (void is never counted in mIoU)
     for seg_gt in seg_gts:
@@ -772,7 +1012,10 @@ def compute_metrics_distributed(seg_preds, seg_gts, size, num_classes, device, i
         seg_gt[seg_gt == num_classes] = ignore_index
 
     # Collect metrics from all devices
-    if dist_on == 'cpu':
+    if utils.get_world_size() == 1:
+        all_seg_preds = seg_preds
+        all_seg_gts = seg_gts
+    elif dist_on == 'cpu':
         all_seg_preds = collect_results_cpu(seg_preds, size, tmpdir=None)
         all_seg_gts = collect_results_cpu(seg_gts, size, tmpdir=None)
     elif dist_on == 'gpu':
@@ -784,10 +1027,15 @@ def compute_metrics_distributed(seg_preds, seg_gts, size, num_classes, device, i
         dist.all_gather_object(all_seg_gts, seg_gts)
 
     ret_metrics_mean = torch.zeros(3, dtype=float, device=device)
+    per_class = None
 
     if utils.is_main_process():
-        ordered_seg_preds = [result for result_part in all_seg_preds for result in result_part]
-        ordered_seg_gts = [result for result_part in all_seg_gts for result in result_part]
+        if utils.get_world_size() == 1 or dist_on == 'cpu':
+            ordered_seg_preds = all_seg_preds[:size]
+            ordered_seg_gts = all_seg_gts[:size]
+        else:
+            ordered_seg_preds = [result for result_part in all_seg_preds for result in result_part]
+            ordered_seg_gts = [result for result_part in all_seg_gts for result in result_part]
 
         ret_metrics = mean_iou(results=ordered_seg_preds,
                                gt_seg_maps=ordered_seg_gts,
@@ -802,12 +1050,31 @@ def compute_metrics_distributed(seg_preds, seg_gts, size, num_classes, device, i
             dtype=float,
             device=device,
         )
-        # cat_iou = ret_metrics[2]
+        if return_per_class:
+            class_names = get_semseg_classes(dataset_name)
+            per_class = []
+            class_acc = ret_metrics[1]
+            class_iou = ret_metrics[2]
+            for idx in range(num_classes):
+                name = class_names[idx] if idx < len(class_names) else f'class_{idx}'
+                per_class.append({
+                    'class_index': idx,
+                    'class_name': name,
+                    'accuracy': None if np.isnan(class_acc[idx]) else float(np.round(class_acc[idx] * 100, 4)),
+                    'iou': None if np.isnan(class_iou[idx]) else float(np.round(class_iou[idx] * 100, 4)),
+                })
 
     # broadcast metrics from 0 to all nodes
-    dist.broadcast(ret_metrics_mean, 0)
+    if utils.get_world_size() > 1:
+        dist.broadcast(ret_metrics_mean, 0)
     pix_acc, mean_acc, miou = ret_metrics_mean
-    ret = dict(pixel_accuracy=pix_acc, mean_accuracy=mean_acc, mean_iou=miou)
+    ret = dict(
+        pixel_accuracy=float(pix_acc.item()),
+        mean_accuracy=float(mean_acc.item()),
+        mean_iou=float(miou.item()),
+    )
+    if return_per_class:
+        ret['per_class'] = per_class
     return ret
 
 

@@ -13,3 +13,13 @@ runs/
 *.DS_Store
 notebooks/
 pretrained/
+AGENTS.MD
+TASKS.MD
+progress_reports/
+playground/
+SETUP_RCP.md
+REPO_NOTES.md
+PLOTS.MD
+SETUP_SCITAS.md
+CLUSTERS.md
+*.sh
