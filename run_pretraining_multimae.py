@@ -132,6 +132,8 @@ def get_args():
                         help='Set to True/False to enable/disable computing the loss on non-masked tokens')
     parser.add_argument('--no_loss_on_unmasked', action='store_false', dest='loss_on_unmasked')
     parser.set_defaults(loss_on_unmasked=False)
+    parser.add_argument('--loss_tasks', default='', type=str,
+                        help='Diagnostic override: hyphen-separated tasks to include in optimizer loss. Empty means all predicted tasks.')
 
 
     # Optimizer parameters
@@ -206,6 +208,8 @@ def get_args():
     parser.set_defaults(auto_resume=True)
 
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N', help='start epoch')
+    parser.add_argument('--stop_after_epoch', default=None, type=int,
+                        help='Optional diagnostic stop: exit training after saving/logging this epoch.')
     parser.add_argument('--num_workers', default=10, type=int)
     parser.add_argument('--pin_mem', action='store_true',
                         help='Pin CPU memory in DataLoader for more efficient (sometimes) transfer to GPU.')
@@ -462,7 +466,8 @@ def main(args):
             sample_tasks_uniformly=args.sample_tasks_uniformly,
             standardize_depth=args.standardize_depth,
             extra_norm_pix_loss=args.extra_norm_pix_loss,
-            fp32_output_adapters=args.fp32_output_adapters.split('-')
+            fp32_output_adapters=args.fp32_output_adapters.split('-'),
+            loss_tasks=args.loss_tasks.split('-') if args.loss_tasks else None,
         )
         if log_writer is not None:
             log_writer.update({**{k: v for k, v in train_stats.items()}, 'epoch': epoch})
@@ -479,6 +484,10 @@ def main(args):
             with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
                 f.write(json.dumps(log_stats) + "\n")
 
+        if args.stop_after_epoch is not None and epoch >= args.stop_after_epoch:
+            print(f"Stopping after epoch {epoch} due to --stop_after_epoch={args.stop_after_epoch}")
+            break
+
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
@@ -490,7 +499,8 @@ def train_one_epoch(model: torch.nn.Module, data_loader: Iterable, tasks_loss_fn
                     log_writer=None, lr_scheduler=None, start_steps=None, lr_schedule_values=None, wd_schedule_values=None,
                     num_encoded_tokens: int = 196, in_domains: List[str] = [] , loss_on_unmasked: bool = True,
                     alphas: float = 1.0, sample_tasks_uniformly: bool = False, standardize_depth: bool = True,
-                    extra_norm_pix_loss: bool = False, fp32_output_adapters: List[str] = []):
+                    extra_norm_pix_loss: bool = False, fp32_output_adapters: List[str] = [],
+                    loss_tasks: List[str] = None):
     model.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
@@ -549,11 +559,16 @@ def train_one_epoch(model: torch.nn.Module, data_loader: Iterable, tasks_loss_fn
                     task_losses[task] = tasks_loss_fn[task](preds[task].float(), target, mask=masks.get(task, None))
 
             weighted_task_losses = loss_balancer(task_losses)
-            loss = sum(weighted_task_losses.values())
+            selected_loss_tasks = loss_tasks if loss_tasks is not None else list(weighted_task_losses.keys())
+            missing_loss_tasks = [task for task in selected_loss_tasks if task not in weighted_task_losses]
+            if missing_loss_tasks:
+                raise ValueError(f"loss_tasks contains tasks with no predicted loss: {missing_loss_tasks}")
+            loss = sum(weighted_task_losses[task] for task in selected_loss_tasks)
 
-        loss_value = sum(task_losses.values()).item()
+        loss_value = loss.item()
         task_loss_values = {f'{task}_loss': l.item() for task, l in task_losses.items()}
         weighted_task_loss_values = {f'{task}_loss_weighted': l.item() for task, l in weighted_task_losses.items()}
+        selected_loss_values = {f'{task}_loss_selected': weighted_task_losses[task].item() for task in selected_loss_tasks}
 
         if not math.isfinite(loss_value):
             print("Loss is {}, stopping training".format(loss_value))
@@ -597,6 +612,7 @@ def train_one_epoch(model: torch.nn.Module, data_loader: Iterable, tasks_loss_fn
             )
             log_writer.update(task_loss_values)
             log_writer.update(weighted_task_loss_values)
+            log_writer.update(selected_loss_values)
             log_writer.set_step()
 
         if lr_scheduler is not None:
